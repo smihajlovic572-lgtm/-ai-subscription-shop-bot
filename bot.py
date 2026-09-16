@@ -12,7 +12,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 from database import Database
@@ -78,12 +78,21 @@ async def edit_or_send(event: Message | CallbackQuery, text: str, markup=None) -
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await db.upsert_user(message.from_user)
-    await message.answer(
-        f"<b>{ce('bot')} Магазин AI-подписок</b>\n\n"
-        "Выберите сервис, оформите заказ и отправьте подтверждение оплаты. "
-        "Менеджер проверит его и выдаст подписку.",
-        reply_markup=home_kb(message.from_user.id),
+    welcome_text = (
+        f"<b>{ce('bot')} Добро пожаловать в магазин AI-подписок!</b>\n\n"
+        "Здесь можно оформить доступ к популярным нейросетям быстро и удобно.\n\n"
+        f"{ce('box')} Выберите нужный сервис в каталоге.\n"
+        f"{ce('wallet')} Оплатите заказ по указанным реквизитам.\n"
+        f"{ce('attach')} Отправьте чек — менеджер проверит оплату и выдаст подписку."
     )
+    try:
+        await message.answer_photo(
+            photo=FSInputFile("welcome.png"),
+            caption=welcome_text,
+            reply_markup=home_kb(message.from_user.id),
+        )
+    except OSError:
+        await message.answer(welcome_text, reply_markup=home_kb(message.from_user.id))
 
 
 @router.callback_query(F.data == "home")
