@@ -32,6 +32,7 @@ def parse_admin_ids(raw: str) -> set[int]:
 ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 SUPPORT = os.getenv("SUPPORT_USERNAME", "@support")
 PAYMENT_DETAILS = os.getenv("PAYMENT_DETAILS", "Укажите реквизиты в .env")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "Gpt_Astra6f_bot").lstrip("@")
 
 router = Router()
 db = Database()
@@ -42,6 +43,10 @@ class Flow(StatesGroup):
     delivery = State()
     product = State()
     broadcast = State()
+    topup_amount = State()
+    topup_proof = State()
+    product_stock = State()
+    product_price = State()
 
 
 def btn(text: str, icon: str, **kwargs) -> InlineKeyboardButton:
@@ -78,6 +83,21 @@ async def edit_or_send(event: Message | CallbackQuery, text: str, markup=None) -
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await db.upsert_user(message.from_user)
+    if message.text and message.text.startswith("/start product_"):
+        raw_id = message.text.removeprefix("/start product_")
+        if raw_id.isdigit():
+            p = await db.one("SELECT * FROM products WHERE id=? AND active=1", (int(raw_id),))
+            if p:
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [btn("Купить", "wallet", callback_data=f"buy:{p['id']}")],
+                    [btn("Главное меню", "home", callback_data="home")],
+                ])
+                await message.answer(
+                    f"<b>{ce('tag')} {escape(p['name'])}</b>\n\n{escape(p['description'])}\n\n"
+                    f"Цена: <b>{p['price']} ₽</b>\nВ наличии: <b>{p['stock']} шт.</b>",
+                    reply_markup=kb,
+                )
+                return
     welcome_text = (
         f"<b>{ce('bot')} Добро пожаловать в магазин AI-подписок!</b>\n\n"
         "Здесь можно оформить доступ к популярным нейросетям быстро и удобно.\n\n"
@@ -104,7 +124,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "catalog")
 async def catalog(callback: CallbackQuery) -> None:
     products = await db.all("SELECT * FROM products WHERE active=1 ORDER BY id")
-    rows = [[btn(f"{p['name']} · {p['price']} ₽", "tag", callback_data=f"product:{p['id']}")] for p in products]
+    rows = [[btn(f"{p['name']} · {p['price']} ₽ · {p['stock']} шт.", "tag", callback_data=f"product:{p['id']}")] for p in products]
     rows.append([btn("Назад", "down", callback_data="home")])
     await edit_or_send(callback, f"<b>{ce('box')} Каталог</b>\n\nВыберите подписку:", InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -117,10 +137,11 @@ async def product(callback: CallbackQuery) -> None:
         await callback.answer("Товар недоступен", show_alert=True)
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("Купить", "wallet", callback_data=f"buy:{p['id']}")],
+        [btn("Купить с баланса", "wallet", callback_data=f"buy:{p['id']}")],
+        [btn("Ссылка на товар", "link", url=f"https://t.me/{BOT_USERNAME}?start=product_{p['id']}")],
         [btn("Назад", "down", callback_data="catalog")],
     ])
-    await edit_or_send(callback, f"<b>{ce('tag')} {escape(p['name'])}</b>\n\n{escape(p['description'])}\n\n<b>Цена: {p['price']} ₽</b>", kb)
+    await edit_or_send(callback, f"<b>{ce('tag')} {escape(p['name'])}</b>\n\n{escape(p['description'])}\n\n<b>Цена: {p['price']} ₽</b>\nВ наличии: <b>{p['stock']} шт.</b>", kb)
 
 
 @router.callback_query(F.data.startswith("buy:"))
@@ -130,20 +151,32 @@ async def buy(callback: CallbackQuery, state: FSMContext) -> None:
     if not p:
         await callback.answer("Товар недоступен", show_alert=True)
         return
-    order_id = await db.execute(
-        "INSERT INTO orders(user_id,product_id,price) VALUES(?,?,?)",
-        (callback.from_user.id, product_id, p["price"]),
-    )
-    await state.set_state(Flow.payment_proof)
-    await state.update_data(order_id=order_id)
-    await edit_or_send(
-        callback,
-        f"<b>{ce('coin')} Заказ №{order_id}</b>\n\n"
-        f"Товар: <b>{escape(p['name'])}</b>\nК оплате: <b>{p['price']} ₽</b>\n\n"
-        f"Реквизиты:\n<code>{escape(PAYMENT_DETAILS)}</code>\n\n"
-        f"{ce('attach')} После оплаты отправьте сюда чек: фото, документ или текст.",
-        back("cancel_order"),
-    )
+    ok, reason, order_id = await db.purchase(callback.from_user.id, product_id)
+    if not ok:
+        if reason == "out_of_stock":
+            await callback.answer("Товар закончился", show_alert=True)
+            return
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [btn("Пополнить баланс", "coin", callback_data="topup")],
+            [btn("Назад", "down", callback_data=f"product:{product_id}")],
+        ])
+        await edit_or_send(callback, f"<b>{ce('wallet')} Недостаточно средств</b>\n\nПополните баланс и повторите покупку.", kb)
+        return
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Подтвердить", "ok", callback_data=f"approve:{order_id}"), btn("Отклонить", "cancel", callback_data=f"reject:{order_id}")]
+    ])
+    for admin_id in ADMIN_IDS:
+        try:
+            await callback.bot.send_message(
+                admin_id,
+                f"<b>{ce('bell')} Новый заказ №{order_id}</b>\n\n"
+                f"Клиент: <a href=\"tg://user?id={callback.from_user.id}\">{escape(callback.from_user.full_name)}</a>\n"
+                f"Товар: {escape(p['name'])}\nСумма списана: {p['price']} ₽",
+                reply_markup=admin_kb,
+            )
+        except TelegramForbiddenError:
+            pass
+    await edit_or_send(callback, f"<b>{ce('ok')} Заказ №{order_id} оплачен с баланса</b>\n\nМенеджер подготовит подписку.", home_kb(callback.from_user.id))
 
 
 @router.callback_query(F.data == "cancel_order")
@@ -189,9 +222,104 @@ async def proof(message: Message, state: FSMContext, bot: Bot) -> None:
 
 
 @router.callback_query(F.data == "profile")
-async def profile(callback: CallbackQuery) -> None:
+async def profile(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     count = (await db.one("SELECT COUNT(*) n FROM orders WHERE user_id=?", (callback.from_user.id,)))["n"]
-    await edit_or_send(callback, f"<b>{ce('profile')} Профиль</b>\n\nID: <code>{callback.from_user.id}</code>\nЗаказов: <b>{count}</b>", back())
+    user = await db.one("SELECT * FROM users WHERE id=?", (callback.from_user.id,))
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Пополнить баланс", "coin", callback_data="topup")],
+        [btn("Мои заказы", "file", callback_data="orders")],
+        [btn("Назад", "down", callback_data="home")],
+    ])
+    await edit_or_send(
+        callback,
+        f"<b>{ce('profile')} Профиль</b>\n\n"
+        f"Имя: <b>{escape(callback.from_user.full_name)}</b>\n"
+        f"ID: <code>{callback.from_user.id}</code>\n"
+        f"Баланс: <b>{user['balance']} ₽</b>\nЗаказов: <b>{count}</b>",
+        kb,
+    )
+
+
+@router.callback_query(F.data == "topup")
+async def topup_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(Flow.topup_amount)
+    await edit_or_send(
+        callback,
+        f"<b>{ce('coin')} Пополнение баланса</b>\n\nВведите сумму пополнения в рублях, например: <code>1000</code>",
+        back("profile"),
+    )
+
+
+@router.message(Flow.topup_amount)
+async def topup_amount(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").replace(" ", "")
+    if not raw.isdigit() or not 50 <= int(raw) <= 500_000:
+        await message.answer("Введите сумму от 50 до 500 000 ₽ целым числом.")
+        return
+    amount = int(raw)
+    topup_id = await db.execute("INSERT INTO topups(user_id,amount) VALUES(?,?)", (message.from_user.id, amount))
+    await state.set_state(Flow.topup_proof)
+    await state.update_data(topup_id=topup_id, amount=amount)
+    await message.answer(
+        f"<b>{ce('wallet')} Пополнение №{topup_id}</b>\n\n"
+        f"Сумма: <b>{amount} ₽</b>\n\nРеквизиты:\n<code>{escape(PAYMENT_DETAILS)}</code>\n\n"
+        f"{ce('attach')} После оплаты отправьте чек: фото, документ или текст.",
+        reply_markup=back("profile"),
+    )
+
+
+@router.message(Flow.topup_proof)
+async def topup_proof(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data(); topup_id = data["topup_id"]; amount = data["amount"]
+    proof_type, proof_value = "text", message.text or message.caption or "Подтверждение"
+    if message.photo:
+        proof_type, proof_value = "photo", message.photo[-1].file_id
+    elif message.document:
+        proof_type, proof_value = "document", message.document.file_id
+    await db.execute("UPDATE topups SET status='paid', proof_type=?, proof_value=? WHERE id=?", (proof_type, proof_value, topup_id))
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Зачислить", "ok", callback_data=f"topup_ok:{topup_id}"), btn("Отклонить", "cancel", callback_data=f"topup_no:{topup_id}")]
+    ])
+    caption = (
+        f"<b>{ce('coin')} Пополнение №{topup_id}</b>\n\n"
+        f"Клиент: <a href=\"tg://user?id={message.from_user.id}\">{escape(message.from_user.full_name)}</a>\n"
+        f"Сумма: <b>{amount} ₽</b>"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            if proof_type == "photo": await bot.send_photo(admin_id, proof_value, caption=caption, reply_markup=kb)
+            elif proof_type == "document": await bot.send_document(admin_id, proof_value, caption=caption, reply_markup=kb)
+            else: await bot.send_message(admin_id, caption + f"\nПодтверждение: {escape(proof_value)}", reply_markup=kb)
+        except TelegramForbiddenError:
+            pass
+    await state.clear()
+    await message.answer(f"<b>{ce('clock')} Пополнение отправлено на проверку</b>", reply_markup=home_kb(message.from_user.id))
+
+
+@router.callback_query(F.data.startswith("topup_ok:"))
+async def topup_approve(callback: CallbackQuery, bot: Bot) -> None:
+    if not is_admin(callback.from_user.id): return
+    topup_id = int(callback.data.split(":")[1])
+    ok, user_id, amount = await db.approve_topup(topup_id)
+    if not ok:
+        await callback.answer("Уже обработано", show_alert=True); return
+    await bot.send_message(user_id, f"<b>{ce('ok')} Баланс пополнен на {amount} ₽</b>")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Средства зачислены")
+
+
+@router.callback_query(F.data.startswith("topup_no:"))
+async def topup_reject(callback: CallbackQuery, bot: Bot) -> None:
+    if not is_admin(callback.from_user.id): return
+    topup_id = int(callback.data.split(":")[1])
+    topup = await db.one("SELECT * FROM topups WHERE id=?", (topup_id,))
+    if not topup or topup["status"] != "paid":
+        await callback.answer("Уже обработано", show_alert=True); return
+    await db.execute("UPDATE topups SET status='rejected' WHERE id=?", (topup_id,))
+    await bot.send_message(topup["user_id"], f"<b>{ce('cancel')} Пополнение №{topup_id} отклонено</b>\n\nСвяжитесь с поддержкой: {escape(SUPPORT)}")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Отклонено")
 
 
 @router.callback_query(F.data == "orders")
@@ -282,9 +410,29 @@ async def reject(callback: CallbackQuery, bot: Bot) -> None:
 async def admin_products(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id): return
     items = await db.all("SELECT * FROM products ORDER BY id")
-    rows = [[btn(f"{p['name']} · {'ON' if p['active'] else 'OFF'}", "eye" if p['active'] else "hidden", callback_data=f"toggle:{p['id']}")] for p in items]
+    rows = [[btn(f"{p['name']} · {p['price']} ₽ · {p['stock']} шт.", "eye" if p['active'] else "hidden", callback_data=f"admin_product:{p['id']}")] for p in items]
     rows.append([btn("Назад", "down", callback_data="admin")])
     await edit_or_send(callback, f"<b>{ce('box')} Товары</b>\n\nНажмите, чтобы включить или выключить:", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("admin_product:"))
+async def admin_product(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id): return
+    pid = int(callback.data.split(":")[1])
+    p = await db.one("SELECT * FROM products WHERE id=?", (pid,))
+    if not p: return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Поступление товара", "box", callback_data=f"stock:{pid}"), btn("Изменить цену", "coin", callback_data=f"price:{pid}")],
+        [btn("Выключить" if p["active"] else "Включить", "eye" if p["active"] else "hidden", callback_data=f"toggle:{pid}")],
+        [btn("Перейти к товару", "link", url=f"https://t.me/{BOT_USERNAME}?start=product_{pid}")],
+        [btn("Назад", "down", callback_data="admin_products")],
+    ])
+    await edit_or_send(
+        callback,
+        f"<b>{ce('tag')} {escape(p['name'])}</b>\n\nЦена: <b>{p['price']} ₽</b>\n"
+        f"Остаток: <b>{p['stock']} шт.</b>\nСтатус: <b>{'в продаже' if p['active'] else 'скрыт'}</b>",
+        kb,
+    )
 
 
 @router.callback_query(F.data.startswith("toggle:"))
@@ -295,23 +443,61 @@ async def toggle(callback: CallbackQuery) -> None:
     await admin_products(callback)
 
 
+@router.callback_query(F.data.startswith("stock:"))
+async def stock_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id): return
+    pid = int(callback.data.split(":")[1])
+    await state.set_state(Flow.product_stock); await state.update_data(product_id=pid)
+    await edit_or_send(callback, f"<b>{ce('box')} Поступление товара</b>\n\nВведите количество новых единиц, например: <code>10</code>", back(f"admin_product:{pid}"))
+
+
+@router.message(Flow.product_stock)
+async def stock_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id): return
+    raw = (message.text or "").strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= 100_000:
+        await message.answer("Введите количество от 1 до 100 000."); return
+    data = await state.get_data(); pid = data["product_id"]
+    await db.execute("UPDATE products SET stock=stock+? WHERE id=?", (int(raw), pid))
+    await state.clear(); await message.answer(f"{ce('ok')} Добавлено: {int(raw)} шт.")
+
+
+@router.callback_query(F.data.startswith("price:"))
+async def price_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id): return
+    pid = int(callback.data.split(":")[1])
+    await state.set_state(Flow.product_price); await state.update_data(product_id=pid)
+    await edit_or_send(callback, f"<b>{ce('coin')} Изменение цены</b>\n\nВведите новую цену в рублях:", back(f"admin_product:{pid}"))
+
+
+@router.message(Flow.product_price)
+async def price_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id): return
+    raw = (message.text or "").replace(" ", "")
+    if not raw.isdigit() or not 1 <= int(raw) <= 10_000_000:
+        await message.answer("Введите корректную цену целым числом."); return
+    data = await state.get_data(); pid = data["product_id"]
+    await db.execute("UPDATE products SET price=? WHERE id=?", (int(raw), pid))
+    await state.clear(); await message.answer(f"{ce('ok')} Новая цена: {int(raw)} ₽")
+
+
 @router.callback_query(F.data == "admin_add")
 async def admin_add(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_admin(callback.from_user.id): return
     await state.set_state(Flow.product)
-    await edit_or_send(callback, f"<b>{ce('edit')} Новый товар</b>\n\nОтправьте одной строкой:\n<code>Название | Описание | Цена</code>", back("admin"))
+    await edit_or_send(callback, f"<b>{ce('edit')} Новый товар</b>\n\nОтправьте одной строкой:\n<code>Название | Описание | Цена | Количество</code>", back("admin"))
 
 
 @router.message(Flow.product)
 async def add_product(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id): return
     try:
-        name, description, raw_price = [x.strip() for x in (message.text or "").split("|", 2)]
-        price = int(raw_price)
-        if not name or not description or price <= 0: raise ValueError
+        name, description, raw_price, raw_stock = [x.strip() for x in (message.text or "").split("|", 3)]
+        price, stock = int(raw_price), int(raw_stock)
+        if not name or not description or price <= 0 or stock < 0: raise ValueError
     except ValueError:
-        await message.answer("Неверный формат. Пример: ChatGPT Plus | На 1 месяц | 1990"); return
-    await db.execute("INSERT INTO products(name,description,price) VALUES(?,?,?)", (name, description, price))
+        await message.answer("Неверный формат. Пример: ChatGPT Plus | На 1 месяц | 1990 | 10"); return
+    await db.execute("INSERT INTO products(name,description,price,stock) VALUES(?,?,?,?)", (name, description, price, stock))
     await state.clear(); await message.answer(f"{ce('ok')} Товар добавлен.")
 
 
